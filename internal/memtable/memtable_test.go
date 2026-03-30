@@ -3,27 +3,33 @@ package memtable
 import (
 	"bytes"
 	"fmt"
+	lsmiter "lsm-tree/internal/iter"
 	"math"
 	"math/rand"
 	"testing"
 	"unsafe"
 )
 
-func collectPairs(it Iterator) [][2]string {
+func collectValuePairs(it lsmiter.ValueIterator) [][2]string {
 	defer it.Close()
 	var got [][2]string
 	for it.Valid() {
-		got = append(got, [2]string{string(it.Key()), string(it.Value())})
+		item := it.Item()
+		got = append(got, [2]string{string(item.Key), string(item.Value)})
 		it.Next()
 	}
 	return got
 }
 
-func collectRawPairs(it RawIterator) [][2]string {
+func collectRawValuePairs(it lsmiter.ValueIterator) [][2]string {
+	return collectValuePairs(it)
+}
+
+func collectEntries(it lsmiter.EntryIterator) []lsmiter.Entry {
 	defer it.Close()
-	var got [][2]string
+	var got []lsmiter.Entry
 	for it.Valid() {
-		got = append(got, [2]string{string(it.Key()), string(it.Value())})
+		got = append(got, it.Item())
 		it.Next()
 	}
 	return got
@@ -133,7 +139,7 @@ func TestMemtableIter(t *testing.T) {
 	mt.Put([]byte("c"), []byte("3"))
 	mt.Delete([]byte("b")) // b 已删除，迭代时不应出现
 
-	got := collectPairs(mt.Iter())
+	got := collectValuePairs(mt.Values())
 	want := [][2]string{{"a", "1"}, {"c", "3"}}
 	if len(got) != len(want) {
 		t.Fatalf("Iter got %d pairs, want %d", len(got), len(want))
@@ -156,7 +162,7 @@ func TestMemtableIterRange(t *testing.T) {
 	mt.Put([]byte("e"), []byte("5"))
 
 	// [b, d) 应得到 b, c
-	got := collectPairs(mt.IterRange([]byte("b"), []byte("d")))
+	got := collectValuePairs(mt.ValuesRange([]byte("b"), []byte("d")))
 	want := [][2]string{{"b", "2"}, {"c", "3"}}
 	if len(got) != len(want) {
 		t.Fatalf("IterRange(b,d) got %d pairs, want %d", len(got), len(want))
@@ -168,33 +174,29 @@ func TestMemtableIterRange(t *testing.T) {
 	}
 
 	// 仅 start：从 "c" 到结尾
-	got = collectPairs(mt.IterRange([]byte("c"), nil))
+	got = collectValuePairs(mt.ValuesRange([]byte("c"), nil))
 	want = [][2]string{{"c", "3"}, {"d", "4"}, {"e", "5"}}
 	if len(got) != 3 || got[0][0] != "c" || got[2][0] != "e" {
 		t.Fatalf("IterRange(c,nil) got %v", got)
 	}
 
 	// 仅 end：从开头到 "c"（不含 c）
-	got = collectPairs(mt.IterRange(nil, []byte("c")))
+	got = collectValuePairs(mt.ValuesRange(nil, []byte("c")))
 	want = [][2]string{{"a", "1"}, {"b", "2"}}
 	if len(got) != 2 || got[0][0] != "a" || got[1][0] != "b" {
 		t.Fatalf("IterRange(nil,c) got %v", got)
 	}
 
 	// 空范围 [d, d)
-	got = collectPairs(mt.IterRange([]byte("d"), []byte("d")))
+	got = collectValuePairs(mt.ValuesRange([]byte("d"), []byte("d")))
 	if len(got) != 0 {
 		t.Fatalf("IterRange(d,d) got %d pairs, want 0", len(got))
 	}
 }
 
-// TestMemtableFlushIterable 验证 FlushIterable 的 raw 迭代结果与安全迭代一致，且范围语义保持一致。
-func TestMemtableFlushIterable(t *testing.T) {
+// TestMemtableRawIterators 验证 raw 迭代结果与安全迭代一致，且范围语义保持一致。
+func TestMemtableRawIterators(t *testing.T) {
 	mt := NewMemtable()
-	fi, ok := mt.(FlushIterable)
-	if !ok {
-		t.Fatal("NewMemtable() should implement FlushIterable")
-	}
 	mt.Put([]byte("a"), []byte("1"))
 	mt.Put([]byte("b"), []byte("2"))
 	mt.Put([]byte("c"), []byte("3"))
@@ -202,8 +204,8 @@ func TestMemtableFlushIterable(t *testing.T) {
 
 	// NewRawIterator 与 Iter 结果一致
 	var raw [][2]string
-	raw = collectRawPairs(fi.RawIter())
-	copied := collectPairs(mt.Iter())
+	raw = collectRawValuePairs(mt.RawValues())
+	copied := collectValuePairs(mt.Values())
 	if len(raw) != len(copied) {
 		t.Fatalf("IterRaw got %d, Iter got %d", len(raw), len(copied))
 	}
@@ -214,8 +216,8 @@ func TestMemtableFlushIterable(t *testing.T) {
 	}
 
 	// NewRawRangeIterator [a, c) 与 IterRange 一致
-	raw = collectRawPairs(fi.RawIterRange([]byte("a"), []byte("c")))
-	copied = collectPairs(mt.IterRange([]byte("a"), []byte("c")))
+	raw = collectRawValuePairs(mt.RawValuesRange([]byte("a"), []byte("c")))
+	copied = collectValuePairs(mt.ValuesRange([]byte("a"), []byte("c")))
 	if len(raw) != len(copied) {
 		t.Fatalf("IterRawRange got %d, IterRange got %d", len(raw), len(copied))
 	}
@@ -237,7 +239,7 @@ func TestMemtableIterLatestVersionAndDelete(t *testing.T) {
 	mt.Delete([]byte("c"))
 	mt.Put([]byte("c"), []byte("v2")) // delete 后新 put，应产出 v2
 
-	got := collectPairs(mt.Iter())
+	got := collectValuePairs(mt.Values())
 
 	want := [][2]string{{"a", "v2"}, {"c", "v2"}}
 	if len(got) != len(want) {
@@ -259,7 +261,7 @@ func TestMemtableIterRangeStartLowerBoundAndEndExclusive(t *testing.T) {
 	mt.Put([]byte("f"), []byte("6"))
 
 	// start="b" 不存在，应从下一个 key "c" 开始；end="f" 为开区间，不包含 f
-	got := collectPairs(mt.IterRange([]byte("b"), []byte("f")))
+	got := collectValuePairs(mt.ValuesRange([]byte("b"), []byte("f")))
 
 	want := [][2]string{{"c", "3"}, {"e", "5"}}
 	if len(got) != len(want) {
@@ -277,12 +279,13 @@ func TestMemtableIterReturnsCopiedBuffers(t *testing.T) {
 	mt := NewMemtable()
 	mt.Put([]byte("k"), []byte("value"))
 
-	it := mt.Iter()
+	it := mt.Values()
 	if !it.Valid() {
 		t.Fatal("iterator should be valid")
 	}
-	key := it.Key()
-	value := it.Value()
+	item := it.Item()
+	key := item.Key
+	value := item.Value
 	key[0] = 'x'
 	value[0] = 'X'
 	it.Close()
@@ -290,12 +293,13 @@ func TestMemtableIterReturnsCopiedBuffers(t *testing.T) {
 		t.Fatalf("Get(k) after Iter mutation = %q, %v, want \"value\", true", v, ok)
 	}
 
-	it = mt.IterRange([]byte("k"), nil)
+	it = mt.ValuesRange([]byte("k"), nil)
 	if !it.Valid() {
 		t.Fatal("range iterator should be valid")
 	}
-	key = it.Key()
-	value = it.Value()
+	item = it.Item()
+	key = item.Key
+	value = item.Value
 	key[0] = 'y'
 	value[0] = 'Y'
 	it.Close()
@@ -310,7 +314,7 @@ func TestMemtableIterRangeSupportsEmptyKey(t *testing.T) {
 	mt.Put([]byte(""), []byte("root"))
 	mt.Put([]byte("a"), []byte("1"))
 
-	got := collectPairs(mt.Iter())
+	got := collectValuePairs(mt.Values())
 	if len(got) != 2 || got[0][0] != "" || got[0][1] != "root" || got[1][0] != "a" {
 		t.Fatalf("Iter with empty key got %v, want [[\"\",\"root\"],[\"a\",\"1\"]]", got)
 	}
@@ -325,8 +329,8 @@ func TestMemtableObjectIteratorBasic(t *testing.T) {
 	mt.Delete([]byte("c"))
 	mt.Put([]byte("d"), []byte("4"))
 
-	it := mt.Iter()
-	got := collectPairs(it)
+	it := mt.Values()
+	got := collectValuePairs(it)
 	want := [][2]string{{"a", "1"}, {"b", "2-new"}, {"d", "4"}}
 	if len(got) != len(want) {
 		t.Fatalf("Iter got %d pairs, want %d", len(got), len(want))
@@ -346,8 +350,8 @@ func TestMemtableObjectRangeIterator(t *testing.T) {
 	mt.Put([]byte("e"), []byte("5"))
 	mt.Put([]byte("f"), []byte("6"))
 
-	it := mt.IterRange([]byte("b"), []byte("f"))
-	got := collectPairs(it)
+	it := mt.ValuesRange([]byte("b"), []byte("f"))
+	got := collectValuePairs(it)
 	want := [][2]string{{"c", "3"}, {"e", "5"}}
 	if len(got) != len(want) {
 		t.Fatalf("IterRange got %d pairs, want %d", len(got), len(want))
@@ -364,12 +368,13 @@ func TestMemtableObjectIteratorCloseAndCopyIsolation(t *testing.T) {
 	mt := NewMemtable()
 	mt.Put([]byte("k"), []byte("value"))
 
-	it := mt.Iter()
+	it := mt.Values()
 	if !it.Valid() {
 		t.Fatal("iterator should be valid")
 	}
-	k := it.Key()
-	v := it.Value()
+	item := it.Item()
+	k := item.Key
+	v := item.Value
 	k[0] = 'x'
 	v[0] = 'X'
 	if got, ok := mt.Get([]byte("k")); !ok || string(got) != "value" {
@@ -380,24 +385,46 @@ func TestMemtableObjectIteratorCloseAndCopyIsolation(t *testing.T) {
 	if it.Valid() {
 		t.Fatal("iterator should be invalid after Close")
 	}
-	if it.Key() != nil || it.Value() != nil {
-		t.Fatal("Key/Value should be nil after Close")
+	if got := it.Item(); got.Key != nil || got.Value != nil {
+		t.Fatal("Item should be empty after Close")
 	}
 }
 
-// TestFlushIterableRawIterator 验证 raw 迭代器零拷贝语义：可观察到底层别名且结果与逻辑视图一致。
-func TestFlushIterableRawIterator(t *testing.T) {
-	fi, ok := NewMemtable().(FlushIterable)
-	if !ok {
-		t.Fatal("NewMemtable() should implement FlushIterable")
-	}
-	fi.Put([]byte("a"), []byte("1"))
-	fi.Put([]byte("b"), []byte("2"))
-	fi.Delete([]byte("b"))
-	fi.Put([]byte("c"), []byte("3"))
+// TestEntryIteratorPreservesDelete 验证 EntryIterator 会保留 Delete，供 flush/compaction 使用。
+func TestEntryIteratorPreservesDelete(t *testing.T) {
+	mt := NewMemtable()
+	mt.Put([]byte("a"), []byte("1-old"))
+	mt.Put([]byte("a"), []byte("1-new"))
+	mt.Put([]byte("b"), []byte("2"))
+	mt.Delete([]byte("b"))
+	mt.Delete([]byte("c"))
 
-	it := fi.RawIterRange([]byte("a"), []byte("d"))
-	got := collectRawPairs(it)
+	got := collectEntries(mt.Entries())
+	if len(got) != 3 {
+		t.Fatalf("EntryIter got %d entries, want 3", len(got))
+	}
+
+	if string(got[0].Key) != "a" || got[0].Op != OpPut || string(got[0].Value) != "1-new" {
+		t.Fatalf("EntryIter[0] = %+v, want key=a op=Put value=1-new", got[0])
+	}
+	if string(got[1].Key) != "b" || got[1].Op != OpDelete || got[1].Value != nil {
+		t.Fatalf("EntryIter[1] = %+v, want key=b op=Delete value=nil", got[1])
+	}
+	if string(got[2].Key) != "c" || got[2].Op != OpDelete || got[2].Value != nil {
+		t.Fatalf("EntryIter[2] = %+v, want key=c op=Delete value=nil", got[2])
+	}
+}
+
+// TestRawIteratorAliasesInternalBuffers 验证 raw 迭代器零拷贝语义：可观察到底层别名且结果与逻辑视图一致。
+func TestRawIteratorAliasesInternalBuffers(t *testing.T) {
+	mt := NewMemtable()
+	mt.Put([]byte("a"), []byte("1"))
+	mt.Put([]byte("b"), []byte("2"))
+	mt.Delete([]byte("b"))
+	mt.Put([]byte("c"), []byte("3"))
+
+	it := mt.RawValuesRange([]byte("a"), []byte("d"))
+	got := collectRawValuePairs(it)
 	want := [][2]string{{"a", "1"}, {"c", "3"}}
 	if len(got) != len(want) {
 		t.Fatalf("raw iterator got %d pairs, want %d", len(got), len(want))
@@ -409,17 +436,16 @@ func TestFlushIterableRawIterator(t *testing.T) {
 	}
 
 	// raw iterator 不拷贝：可观察到底层切片别名（仅测试，不代表允许业务代码修改）
-	impl := fi.(*memtableImpl)
-	it2 := fi.RawIter()
+	it2 := mt.RawValues()
 	defer it2.Close()
 	if !it2.Valid() {
 		t.Fatal("raw iterator should be valid")
 	}
-	r, ok := impl.skl.LowerBound(record{Key: []byte("a"), Seq: math.MaxUint64})
+	r, ok := mt.skl.LowerBound(record{Key: []byte("a"), Seq: math.MaxUint64})
 	if !ok {
 		t.Fatal("lower bound for key a should exist")
 	}
-	k := it2.Key()
+	k := it2.Item().Key
 	if len(k) == 0 || len(r.Key) == 0 {
 		t.Fatal("unexpected empty key")
 	}
@@ -431,10 +457,7 @@ func TestFlushIterableRawIterator(t *testing.T) {
 // TestSkiplistOnlySizeUnderestimatesPayload 验证仅统计 skiplist 结构会低估总占用，payload 需单独计入。
 func TestSkiplistOnlySizeUnderestimatesPayload(t *testing.T) {
 	rand.Seed(20260310)
-	mt, ok := NewMemtable().(*memtableImpl)
-	if !ok {
-		t.Fatal("NewMemtable() is not *memtableImpl")
-	}
+	mt := NewMemtable()
 
 	payload := 0
 	for i := 0; i < 200; i++ {

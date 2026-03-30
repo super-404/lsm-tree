@@ -9,6 +9,9 @@ import (
 const maxLevel = 32
 const pFactor = 0.25
 
+// CompareFunc 比较函数：a < b 返回负，a == b 返回 0，a > b 返回正。
+type CompareFunc[T any] func(a, b T) int
+
 // ---- Skiplist[T cmp.Ordered]：内置有序类型的薄封装，内部委托给 SkiplistCmp ----
 
 type Skiplist[T cmp.Ordered] struct {
@@ -42,7 +45,7 @@ type SkiplistCmp[T any] struct {
 type Iterator[T any] struct {
 	curr *skiplistCmpNode[T]
 }
-	
+
 func nodeSizeBytes[T any](forwardCap int) int {
 	const ptrSize = unsafe.Sizeof((*skiplistCmpNode[T])(nil))
 	return int(unsafe.Sizeof(skiplistCmpNode[T]{})) + int(ptrSize)*forwardCap

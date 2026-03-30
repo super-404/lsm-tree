@@ -1,10 +1,8 @@
 package engine
 
-import "lsm-tree/internal/memtable"
-
 // writeCommand 抽象单条写命令，新增命令类型时无需修改 Write 主流程（开闭原则）。
 type writeCommand interface {
-	apply(memtable.Memtable)
+	apply(mutableTable)
 }
 
 type putCommand struct {
@@ -12,7 +10,7 @@ type putCommand struct {
 	value []byte
 }
 
-func (c putCommand) apply(store memtable.Memtable) {
+func (c putCommand) apply(store mutableTable) {
 	store.Put(c.key, c.value)
 }
 
@@ -20,33 +18,33 @@ type deleteCommand struct {
 	key []byte
 }
 
-func (c deleteCommand) apply(store memtable.Memtable) {
+func (c deleteCommand) apply(store mutableTable) {
 	store.Delete(c.key)
 }
 
-type engineBatch struct {
-	owner    *engineDB
+type Batch struct {
+	owner    *Engine
 	commands []writeCommand
 }
 
-func (b *engineBatch) Put(key, value []byte) {
+func (b *Batch) Put(key, value []byte) {
 	b.commands = append(b.commands, putCommand{
 		key:   copyBytes(key),
 		value: copyBytes(value),
 	})
 }
 
-func (b *engineBatch) Delete(key []byte) {
+func (b *Batch) Delete(key []byte) {
 	b.commands = append(b.commands, deleteCommand{
 		key: copyBytes(key),
 	})
 }
 
-func (b *engineBatch) Len() int {
+func (b *Batch) Len() int {
 	return len(b.commands)
 }
 
-func (b *engineBatch) Reset() {
+func (b *Batch) Reset() {
 	b.commands = b.commands[:0]
 }
 

@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: lsm-tree/internal/engine
+cpu: Apple M1
+BenchmarkLSMCompare/engine=map_ref/workload=balanced-1k         	  140546	       837.5 ns/op	    1847 B/op	       3 allocs/op
+BenchmarkLSMCompare/engine=map_ref/workload=write-heavy-4k      	   62372	      1748 ns/op	    6622 B/op	       3 allocs/op
+BenchmarkLSMCompare/engine=map_ref/workload=read-heavy-256b     	  426022	       252.7 ns/op	     306 B/op	       1 allocs/op
+BenchmarkLSMCompare/engine=my_lsm/workload=balanced-1k          	   58558	      7708 ns/op	    1919 B/op	       7 allocs/op
+BenchmarkLSMCompare/engine=my_lsm/workload=write-heavy-4k       	   40957	      5111 ns/op	    6696 B/op	       6 allocs/op
+BenchmarkLSMCompare/engine=my_lsm/workload=read-heavy-256b      	   84562	      6820 ns/op	     341 B/op	       3 allocs/op
+PASS
+ok  	lsm-tree/internal/engine	2.573s

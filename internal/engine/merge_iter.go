@@ -3,12 +3,13 @@ package engine
 import (
 	"bytes"
 	"container/heap"
-	"lsm-tree/internal/db"
+	lsmiter "lsm-tree/internal/iter"
 )
 
-// mergeIterator 合并多张 memtable 的迭代器，按 key 升序产出，同 key 取最新；getValue 用于解析当前 key 的有效值（含 tombstone 屏蔽），为 nil 时直接采用子迭代器 value。
-type mergeIterator struct {
-	iters    []db.Iterator
+// Iterator 合并多张 memtable 的迭代器，按 key 升序产出，同 key 取最新；
+// getValue 用于解析当前 key 的有效值（含 tombstone 屏蔽），为 nil 时直接采用子迭代器 value。
+type Iterator struct {
+	iters    []lsmiter.ValueIterator
 	pq       iteratorMinHeap
 	end      []byte
 	getValue func(key []byte) ([]byte, bool)
@@ -17,18 +18,29 @@ type mergeIterator struct {
 	value    []byte
 }
 
-func (m *mergeIterator) Valid() bool   { return m.valid }
-func (m *mergeIterator) Key() []byte   { return m.key }
-func (m *mergeIterator) Value() []byte { return m.value }
+func (m *Iterator) Valid() bool   { return m.valid }
+func (m *Iterator) Key() []byte   { return m.key }
+func (m *Iterator) Value() []byte { return m.value }
 
-func (m *mergeIterator) Next() {
+// Item 让 Engine 自身的合并迭代器也满足公共 ValueIterator 协议。
+//
+// 这样上层若只关心“这是一个值视图迭代器”，就不必再区分它来自 memtable、
+// sst，还是来自 engine 的多路归并结果。
+func (m *Iterator) Item() lsmiter.Value {
+	if !m.valid {
+		return lsmiter.Value{}
+	}
+	return lsmiter.Value{Key: m.key, Value: m.value}
+}
+
+func (m *Iterator) Next() {
 	if !m.valid {
 		return
 	}
 	m.advance()
 }
 
-func (m *mergeIterator) Close() {
+func (m *Iterator) Close() {
 	for _, it := range m.iters {
 		if it != nil {
 			it.Close()
@@ -46,7 +58,7 @@ func (m *mergeIterator) Close() {
 // 2) 组内按 source 优先级（active/newer immutable/older immutable）选 winner；
 // 3) 组内所有迭代器一并前进，保证同 key 只产出一次；
 // 4) 若 getValue 判定该 key 被 tombstone 屏蔽，则跳过该 key 并继续下一轮。
-func (m *mergeIterator) advance() {
+func (m *Iterator) advance() {
 	m.valid = false
 	m.key = nil
 	m.value = nil
@@ -65,7 +77,7 @@ func (m *mergeIterator) advance() {
 		if m.getValue != nil {
 			value, ok = m.getValue(key)
 		} else {
-			value = winner.it.Value()
+			value = winner.it.Item().Value
 			ok = true
 		}
 
@@ -85,7 +97,7 @@ func (m *mergeIterator) advance() {
 	}
 }
 
-func (m *mergeIterator) initHeap() {
+func (m *Iterator) initHeap() {
 	m.pq = make(iteratorMinHeap, 0, len(m.iters))
 	heap.Init(&m.pq)
 	for source, it := range m.iters {
@@ -93,11 +105,11 @@ func (m *mergeIterator) initHeap() {
 	}
 }
 
-func (m *mergeIterator) pushCandidate(source int, it db.Iterator) {
+func (m *Iterator) pushCandidate(source int, it lsmiter.ValueIterator) {
 	if it == nil || !it.Valid() {
 		return
 	}
-	key := it.Key()
+	key := it.Item().Key
 	if m.end != nil && bytes.Compare(key, m.end) >= 0 {
 		return
 	}
@@ -105,11 +117,11 @@ func (m *mergeIterator) pushCandidate(source int, it db.Iterator) {
 }
 
 // popSameKeyGroup 弹出当前最小 key 的所有来源，并返回该组及 key 的副本。
-func (m *mergeIterator) popSameKeyGroup() ([]iteratorItem, []byte) {
+func (m *Iterator) popSameKeyGroup() ([]iteratorItem, []byte) {
 	first := heap.Pop(&m.pq).(iteratorItem)
-	keyCopy := append([]byte(nil), first.it.Key()...)
+	keyCopy := append([]byte(nil), first.it.Item().Key...)
 	group := []iteratorItem{first}
-	for len(m.pq) > 0 && bytes.Equal(m.pq[0].it.Key(), keyCopy) {
+	for len(m.pq) > 0 && bytes.Equal(m.pq[0].it.Item().Key, keyCopy) {
 		group = append(group, heap.Pop(&m.pq).(iteratorItem))
 	}
 	return group, keyCopy

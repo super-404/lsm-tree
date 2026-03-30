@@ -15,7 +15,7 @@ func main() {
 	fmt.Println("Erase(1):", sl.Erase(1))
 	fmt.Println("Search(1):", sl.Search(1))
 
-	var list skl.SkiplistInterface[string] = skl.NewSkiplist[string]()
+	list := skl.NewSkiplist[string]()
 	list.Add("world")
 	list.Add("hello")
 	fmt.Println("Search(\"hello\"):", list.Search("hello"))

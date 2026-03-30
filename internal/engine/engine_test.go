@@ -3,54 +3,107 @@ package engine
 import (
 	"errors"
 	"fmt"
-	"lsm-tree/internal/db"
+	lsmiter "lsm-tree/internal/iter"
 	"lsm-tree/internal/memtable"
+	"lsm-tree/internal/wal"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 )
 
-type fakeBatch struct{}
+func fixedWALTestDir(t *testing.T, name string) string {
+	t.Helper()
+	root, err := findRepoRoot()
+	if err != nil {
+		t.Fatalf("findRepoRoot error: %v", err)
+	}
+	dir := filepath.Join(root, "test", "wal", name)
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create fixed wal test dir error: %v", err)
+	}
+	return dir
+}
 
-func (f *fakeBatch) Put(key, value []byte) {}
-func (f *fakeBatch) Delete(key []byte)     {}
-func (f *fakeBatch) Len() int              { return 0 }
-func (f *fakeBatch) Reset()                {}
-
-type fakeIter struct{}
-
-func (i *fakeIter) Valid() bool   { return false }
-func (i *fakeIter) Key() []byte   { return nil }
-func (i *fakeIter) Value() []byte { return nil }
-func (i *fakeIter) Next()         {}
-func (i *fakeIter) Close()        {}
+func findRepoRoot() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	cur := wd
+	for {
+		if _, err := os.Stat(filepath.Join(cur, "go.mod")); err == nil {
+			return cur, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fmt.Errorf("go.mod not found from %s upward", wd)
+		}
+		cur = parent
+	}
+}
 
 type fakeMemtable struct {
 	size int
 }
 
-func (m *fakeMemtable) Put(key, value []byte)                {}
-func (m *fakeMemtable) Get(key []byte) ([]byte, bool)        { return nil, false }
+func (m *fakeMemtable) Put(key, value []byte)                            {}
+func (m *fakeMemtable) Get(key []byte) ([]byte, bool)                    { return nil, false }
 func (m *fakeMemtable) GetLatest(key []byte) ([]byte, memtable.Op, bool) { return nil, 0, false }
-func (m *fakeMemtable) Delete(key []byte)                    {}
-func (m *fakeMemtable) Len() int                      { return 0 }
-func (m *fakeMemtable) SizeBytes() int                { return m.size }
-func (m *fakeMemtable) Iter() memtable.Iterator       { return &fakeIter{} }
-func (m *fakeMemtable) IterRange(start, end []byte) memtable.Iterator {
-	return &fakeIter{}
+func (m *fakeMemtable) Delete(key []byte)                                {}
+func (m *fakeMemtable) Len() int                                         { return 0 }
+func (m *fakeMemtable) SizeBytes() int                                   { return m.size }
+func (m *fakeMemtable) Entries() lsmiter.EntryIterator                   { return nil }
+func (m *fakeMemtable) Values() lsmiter.ValueIterator                    { return nil }
+func (m *fakeMemtable) ValuesRange(start, end []byte) lsmiter.ValueIterator {
+	return nil
 }
 
-func collectPairs(it db.Iterator) [][2]string {
+func collectPairs(it lsmiter.ValueIterator) [][2]string {
 	if it == nil {
 		return nil
 	}
 	defer it.Close()
 	var got [][2]string
 	for it.Valid() {
-		got = append(got, [2]string{string(it.Key()), string(it.Value())})
+		item := it.Item()
+		got = append(got, [2]string{string(item.Key), string(item.Value)})
 		it.Next()
 	}
 	return got
+}
+
+func largeValue() []byte {
+	value := make([]byte, 256<<10) // 256KB，足够较快触发 64MB rotate
+	for i := range value {
+		value[i] = byte('a' + i%26)
+	}
+	return value
+}
+
+func waitForFlushState(t *testing.T, e *Engine, wantSSTs int) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e.mu.Lock()
+		gotSSTs := len(e.ssts)
+		gotImmutables := len(e.immutables)
+		flushErr := e.flushErr
+		e.mu.Unlock()
+		if flushErr != nil {
+			t.Fatalf("flush failed: %v", flushErr)
+		}
+		if gotSSTs >= wantSSTs && gotImmutables == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t.Fatalf("waitForFlushState timeout: ssts=%d immutables=%d flushErr=%v", len(e.ssts), len(e.immutables), e.flushErr)
 }
 
 // TestLSMEngine_PutGetDelete 验证基础读写删语义：Put 后可读、Delete 后返回 ErrNotFound。
@@ -76,7 +129,7 @@ func TestLSMEngine_PutGetDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = d.Get([]byte("k1"))
-	if !errors.Is(err, db.ErrNotFound) {
+	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get after Delete: want ErrNotFound, got %v", err)
 	}
 }
@@ -101,7 +154,7 @@ func TestLSMEngine_Write(t *testing.T) {
 	}
 
 	_, err = d.Get([]byte("a"))
-	if !errors.Is(err, db.ErrNotFound) {
+	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get(a) after batch delete: want ErrNotFound, got %v", err)
 	}
 	val, err := d.Get([]byte("b"))
@@ -170,7 +223,7 @@ func TestLSMEngine_NewIterator(t *testing.T) {
 	}
 
 	// [b, n)：应命中 c/k/m
-	got = collectPairs(d.NewIterator(&db.IterOptions{Start: []byte("b"), End: []byte("n")}))
+	got = collectPairs(d.NewIterator(&IterOptions{Start: []byte("b"), End: []byte("n")}))
 	want = [][2]string{{"c", "1"}, {"k", "2"}, {"m", "2"}}
 	if len(got) != len(want) {
 		t.Fatalf("range[b,n) len = %d, want %d, got=%v", len(got), len(want), got)
@@ -182,13 +235,13 @@ func TestLSMEngine_NewIterator(t *testing.T) {
 	}
 
 	// 起点不存在时应从下一个 key 开始；终点开区间不包含自身
-	got = collectPairs(d.NewIterator(&db.IterOptions{Start: []byte("l"), End: []byte("m")}))
+	got = collectPairs(d.NewIterator(&IterOptions{Start: []byte("l"), End: []byte("m")}))
 	if len(got) != 0 {
 		t.Fatalf("range[l,m) should be empty, got=%v", got)
 	}
 
 	// 空范围 [m,m)
-	got = collectPairs(d.NewIterator(&db.IterOptions{Start: []byte("m"), End: []byte("m")}))
+	got = collectPairs(d.NewIterator(&IterOptions{Start: []byte("m"), End: []byte("m")}))
 	if len(got) != 0 {
 		t.Fatalf("range[m,m) should be empty, got=%v", got)
 	}
@@ -232,8 +285,8 @@ func TestLSMEngine_WriteInvalidBatch(t *testing.T) {
 	}
 	defer d.Close()
 
-	if err := d.Write(&fakeBatch{}); !errors.Is(err, errInvalidBatch) {
-		t.Fatalf("Write(fakeBatch): want errInvalidBatch, got %v", err)
+	if err := d.Write(&Batch{}); !errors.Is(err, errInvalidBatch) {
+		t.Fatalf("Write(foreign batch): want errInvalidBatch, got %v", err)
 	}
 }
 
@@ -296,14 +349,14 @@ func TestLSMEngine_BatchBufferIsolationAndReset(t *testing.T) {
 
 // TestLSMEngine_GetPrefersNewestAcrossImmutables 验证跨多层 immutable 同 key 读取时优先返回最新版本。
 func TestLSMEngine_GetPrefersNewestAcrossImmutables(t *testing.T) {
-	e := &engineDB{active: memtable.NewMemtable()}
+	e := &Engine{active: memtable.NewMemtable()}
 
 	e.active.Put([]byte("k"), []byte("v1"))
-	e.immutables = append([]memtable.Memtable{e.active}, e.immutables...) // older
+	e.immutables = append([]mutableTable{e.active}, e.immutables...) // older
 	e.active = memtable.NewMemtable()
 
 	e.active.Put([]byte("k"), []byte("v2"))
-	e.immutables = append([]memtable.Memtable{e.active}, e.immutables...) // newer
+	e.immutables = append([]mutableTable{e.active}, e.immutables...) // newer
 	e.active = memtable.NewMemtable()
 
 	got, err := e.Get([]byte("k"))
@@ -323,12 +376,12 @@ func TestLSMEngine_TombstoneMasksOldPut(t *testing.T) {
 	active := memtable.NewMemtable()
 	active.Delete([]byte("k")) // 墓碑
 
-	e := &engineDB{active: active, immutables: []memtable.Memtable{older}}
+	e := &Engine{active: active, immutables: []mutableTable{older}}
 	got, err := e.Get([]byte("k"))
 	if err == nil {
 		t.Fatalf("Get(k) = %q, nil: want ErrNotFound (tombstone in active should mask old Put)", got)
 	}
-	if !errors.Is(err, db.ErrNotFound) {
+	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get(k) err = %v, want ErrNotFound", err)
 	}
 }
@@ -342,12 +395,13 @@ func TestLSMEngine_IteratorSkipsKeyMaskedByTombstone(t *testing.T) {
 	active.Delete([]byte("a")) // 墓碑，迭代不应产出 "a"
 	active.Put([]byte("b"), []byte("b"))
 
-	e := &engineDB{active: active, immutables: []memtable.Memtable{older}}
+	e := &Engine{active: active, immutables: []mutableTable{older}}
 	it := e.NewIterator(nil)
 	defer it.Close()
 	var got [][2]string
 	for it.Valid() {
-		got = append(got, [2]string{string(it.Key()), string(it.Value())})
+		item := it.Item()
+		got = append(got, [2]string{string(item.Key), string(item.Value)})
 		it.Next()
 	}
 	// 只应有 "b"，不应有 "a"
@@ -358,7 +412,7 @@ func TestLSMEngine_IteratorSkipsKeyMaskedByTombstone(t *testing.T) {
 
 // TestLSMEngine_IteratorDedupAndNewestAcrossImmutables 验证合并迭代时同 key 仅产出一次且取最新版本。
 func TestLSMEngine_IteratorDedupAndNewestAcrossImmutables(t *testing.T) {
-	e := &engineDB{active: memtable.NewMemtable()}
+	e := &Engine{active: memtable.NewMemtable()}
 
 	older := memtable.NewMemtable()
 	older.Put([]byte("a"), []byte("old"))
@@ -366,26 +420,30 @@ func TestLSMEngine_IteratorDedupAndNewestAcrossImmutables(t *testing.T) {
 	newer := memtable.NewMemtable()
 	newer.Put([]byte("a"), []byte("new"))
 
-	e.immutables = []memtable.Memtable{newer, older}
+	e.immutables = []mutableTable{newer, older}
 
 	it := e.NewIterator(nil)
 	defer it.Close()
 	if !it.Valid() {
 		t.Fatal("iterator should be valid")
 	}
-	if string(it.Key()) != "a" || string(it.Value()) != "new" {
-		t.Fatalf("first pair = (%q, %q), want (\"a\", \"new\")", it.Key(), it.Value())
+	item := it.Item()
+	if string(item.Key) != "a" || string(item.Value) != "new" {
+		t.Fatalf("first pair = (%q, %q), want (\"a\", \"new\")", item.Key, item.Value)
 	}
 	it.Next()
 	if it.Valid() {
-		t.Fatalf("iterator should be exhausted, got (%q, %q)", it.Key(), it.Value())
+		last := it.Item()
+		t.Fatalf("iterator should be exhausted, got (%q, %q)", last.Key, last.Value)
 	}
 }
 
 // TestLSMEngine_MaybeRotateThresholdBoundary 验证 64MB 阈值边界：等于阈值不轮转，超过阈值才轮转。
 func TestLSMEngine_MaybeRotateThresholdBoundary(t *testing.T) {
-	e := &engineDB{active: &fakeMemtable{size: maxMemtableSizeBytes}}
-	e.maybeRotate()
+	e := &Engine{active: &fakeMemtable{size: maxMemtableSizeBytes}}
+	if err := e.maybeRotate(); err != nil {
+		t.Fatalf("maybeRotate() error: %v", err)
+	}
 
 	if len(e.immutables) != 0 {
 		t.Fatalf("len(immutables) = %d, want 0 when size == threshold", len(e.immutables))
@@ -395,7 +453,9 @@ func TestLSMEngine_MaybeRotateThresholdBoundary(t *testing.T) {
 	}
 
 	e.active = &fakeMemtable{size: maxMemtableSizeBytes + 1}
-	e.maybeRotate()
+	if err := e.maybeRotate(); err != nil {
+		t.Fatalf("maybeRotate() error: %v", err)
+	}
 	if len(e.immutables) != 1 {
 		t.Fatalf("len(immutables) = %d, want 1 when size > threshold", len(e.immutables))
 	}
@@ -410,11 +470,13 @@ func TestLSMEngine_MaybeRotatePrependsNewestImmutable(t *testing.T) {
 	older := &fakeMemtable{size: 2}
 	newlyFrozen := &fakeMemtable{size: maxMemtableSizeBytes + 1}
 
-	e := &engineDB{
+	e := &Engine{
 		active:     newlyFrozen,
-		immutables: []memtable.Memtable{older, oldest},
+		immutables: []mutableTable{older, oldest},
 	}
-	e.maybeRotate()
+	if err := e.maybeRotate(); err != nil {
+		t.Fatalf("maybeRotate() error: %v", err)
+	}
 
 	if len(e.immutables) != 3 {
 		t.Fatalf("len(immutables) = %d, want 3", len(e.immutables))
@@ -439,10 +501,7 @@ func TestLSMEngine_RotateByRealPutsUntilThresholdExceeded(t *testing.T) {
 	}
 	defer raw.Close()
 
-	e, ok := raw.(*engineDB)
-	if !ok {
-		t.Fatal("Open should return *engineDB")
-	}
+	e := raw
 
 	value := make([]byte, 256<<10) // 256KB，减少循环次数
 	for i := range value {
@@ -511,10 +570,7 @@ func TestLSMEngine_HeavyPutDeleteSameKeysUntilTenImmutables(t *testing.T) {
 	}
 	defer raw.Close()
 
-	e, ok := raw.(*engineDB)
-	if !ok {
-		t.Fatal("Open should return *engineDB")
-	}
+	e := raw
 
 	rng := rand.New(rand.NewSource(20260311))
 	const (
@@ -568,7 +624,7 @@ func TestLSMEngine_HeavyPutDeleteSameKeysUntilTenImmutables(t *testing.T) {
 		got, err := raw.Get([]byte(k))
 		want, exists := model[k]
 		if !exists {
-			if !errors.Is(err, db.ErrNotFound) {
+			if !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get(%q) err=%v, want ErrNotFound", k, err)
 			}
 			continue
@@ -629,7 +685,7 @@ func TestLSMEngine_RandomOpsStress(t *testing.T) {
 			got, err := raw.Get([]byte(k))
 			want, exists := model[k]
 			if !exists {
-				if !errors.Is(err, db.ErrNotFound) {
+				if !errors.Is(err, ErrNotFound) {
 					t.Fatalf("step=%d Get(%q) err=%v, want ErrNotFound", step, k, err)
 				}
 				continue
@@ -699,7 +755,7 @@ func TestLSMEngine_RandomOpsStress(t *testing.T) {
 			got, err := raw.Get([]byte(k))
 			want, exists := model[k]
 			if !exists {
-				if !errors.Is(err, db.ErrNotFound) {
+				if !errors.Is(err, ErrNotFound) {
 					t.Fatalf("Get(%q) err=%v, want ErrNotFound", k, err)
 				}
 			} else {
@@ -723,7 +779,7 @@ func TestLSMEngine_RandomOpsStress(t *testing.T) {
 		got, err := raw.Get([]byte(k))
 		want, exists := model[k]
 		if !exists {
-			if !errors.Is(err, db.ErrNotFound) {
+			if !errors.Is(err, ErrNotFound) {
 				t.Fatalf("final Get(%q) err=%v, want ErrNotFound", k, err)
 			}
 			continue
@@ -734,5 +790,275 @@ func TestLSMEngine_RandomOpsStress(t *testing.T) {
 		if string(got) != string(want) {
 			t.Fatalf("final Get(%q) mismatch got(len=%d) want(len=%d)", k, len(got), len(want))
 		}
+	}
+}
+
+// TestLSMEngine_WALRecoveryBasic 验证 WAL 在重启后可恢复 Put/Delete/Write 的最终状态。
+func TestLSMEngine_WALRecoveryBasic(t *testing.T) {
+	dir := fixedWALTestDir(t, "wal_recovery_basic")
+	walPath := filepath.Join(dir, "wal", "000001.wal")
+	t.Logf("wal path: %s", walPath)
+
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put([]byte("b"), []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Delete([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	b := d.NewBatch()
+	b.Put([]byte("c"), []byte("3"))
+	b.Delete([]byte("b"))
+	b.Put([]byte("a"), []byte("4"))
+	if err := d.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(walPath); err != nil {
+		t.Fatalf("wal file not generated at %s: %v", walPath, err)
+	} else if st.Size() == 0 {
+		t.Fatalf("wal file %s is empty, want > 0 bytes", walPath)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+
+	if v, err := d2.Get([]byte("a")); err != nil || string(v) != "4" {
+		t.Fatalf("Get(a) = %q, %v, want \"4\", nil", v, err)
+	}
+	if _, err := d2.Get([]byte("b")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(b) err = %v, want ErrNotFound", err)
+	}
+	if v, err := d2.Get([]byte("c")); err != nil || string(v) != "3" {
+		t.Fatalf("Get(c) = %q, %v, want \"3\", nil", v, err)
+	}
+}
+
+// TestLSMEngine_WALRecoveryDropsIncompleteBatch 验证回放时只应用完整 batch；未闭合 batch 会被丢弃。
+func TestLSMEngine_WALRecoveryDropsIncompleteBatch(t *testing.T) {
+	dir := fixedWALTestDir(t, "wal_recovery_incomplete_batch")
+	walPath := filepath.Join(dir, "wal", "000001.wal")
+	t.Logf("wal path: %s", walPath)
+
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put([]byte("k"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(walPath); err != nil {
+		t.Fatalf("wal file not generated at %s: %v", walPath, err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := wal.Open(filepath.Join(dir, "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟崩溃前写入：batch begin + put(k,new)，但没有 batch end。
+	if err := w.Append(
+		wal.Record{Type: wal.RecordBatchBegin},
+		wal.Record{Type: wal.RecordPut, Key: []byte("k"), Value: []byte("new")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+
+	v, err := d2.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get(k) err = %v, want nil", err)
+	}
+	if string(v) != "old" {
+		t.Fatalf("Get(k) = %q, want \"old\" (incomplete batch should be ignored)", v)
+	}
+}
+
+// TestLSMEngine_WALSegmentRotateWithMemtableRotate 验证 memtable 轮转时 WAL 也会切换到下一个 segment。
+func TestLSMEngine_WALSegmentRotateWithMemtableRotate(t *testing.T) {
+	dir := fixedWALTestDir(t, "wal_segment_rotate")
+	seg1 := filepath.Join(dir, "wal", "000001.wal")
+	seg2 := filepath.Join(dir, "wal", "000002.wal")
+
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	value := make([]byte, 256<<10)
+	for i := range value {
+		value[i] = byte('a' + i%26)
+	}
+
+	// 写到触发第一次 memtable rotate（64MB 阈值）。
+	rotated := false
+	for i := 0; i < 4000; i++ {
+		k := []byte(fmt.Sprintf("seg-k-%06d", i))
+		if err := d.Put(k, value); err != nil {
+			t.Fatalf("Put(%q) error: %v", k, err)
+		}
+		if _, err := os.Stat(seg2); err == nil {
+			rotated = true
+			break
+		}
+	}
+	if !rotated {
+		t.Fatalf("wal segment did not rotate, %s not found", seg2)
+	}
+	// 旋转后再写一条，确保新 segment 落盘有内容。
+	if err := d.Put([]byte("seg-tail"), value); err != nil {
+		t.Fatalf("Put(seg-tail) error: %v", err)
+	}
+	if st, err := os.Stat(seg1); err != nil {
+		t.Fatalf("segment1 missing: %v", err)
+	} else if st.Size() == 0 {
+		t.Fatalf("segment1 is empty, want > 0")
+	}
+	if st, err := os.Stat(seg2); err != nil {
+		t.Fatalf("segment2 missing: %v", err)
+	} else if st.Size() == 0 {
+		t.Fatalf("segment2 is empty, want > 0")
+	}
+}
+
+// TestLSMEngine_FlushPublishesSST 验证 active 超阈值后会异步 flush 成 SST，并在发布后移除对应 immutable。
+func TestLSMEngine_FlushPublishesSST(t *testing.T) {
+	dir := fixedWALTestDir(t, "flush_publishes_sst")
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	value := largeValue()
+	for i := 0; i < 4000; i++ {
+		key := []byte(fmt.Sprintf("flush-k-%06d", i))
+		if err := d.Put(key, value); err != nil {
+			t.Fatalf("Put(%q) error: %v", key, err)
+		}
+		d.mu.Lock()
+		sstCount := len(d.ssts)
+		d.mu.Unlock()
+		if sstCount >= 1 {
+			break
+		}
+	}
+
+	waitForFlushState(t, d, 1)
+
+	sstPath := filepath.Join(dir, "sst", "000001.sst")
+	if st, err := os.Stat(sstPath); err != nil {
+		t.Fatalf("sst file not found at %s: %v", sstPath, err)
+	} else if st.Size() == 0 {
+		t.Fatalf("sst file %s is empty", sstPath)
+	}
+	if _, err := os.Stat(filepath.Join(dir, manifestFilename)); err != nil {
+		t.Fatalf("manifest not found: %v", err)
+	}
+
+	v, err := d.Get([]byte("flush-k-000000"))
+	if err != nil {
+		t.Fatalf("Get(flush-k-000000) error: %v", err)
+	}
+	if len(v) != len(value) {
+		t.Fatalf("Get(flush-k-000000) len=%d, want %d", len(v), len(value))
+	}
+}
+
+// TestLSMEngine_FlushRecoveryWithDeleteAcrossSSTs 验证 tombstone flush 到更新的 SST 后，不会让更老 SST 中的旧值复活。
+func TestLSMEngine_FlushRecoveryWithDeleteAcrossSSTs(t *testing.T) {
+	dir := fixedWALTestDir(t, "flush_recovery_delete")
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value := largeValue()
+	// 第一轮 flush：把 a=old 和一批填充 key 刷进第一个 SST。
+	if err := d.Put([]byte("a"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4000; i++ {
+		key := []byte(fmt.Sprintf("fill-old-%06d", i))
+		if err := d.Put(key, value); err != nil {
+			t.Fatalf("fill-old Put(%q) error: %v", key, err)
+		}
+		d.mu.Lock()
+		sstCount := len(d.ssts)
+		d.mu.Unlock()
+		if sstCount >= 1 {
+			break
+		}
+	}
+	waitForFlushState(t, d, 1)
+
+	// 第二轮 flush：写入删除 a 的 tombstone，并再刷出第二个 SST。
+	if err := d.Delete([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4000; i++ {
+		key := []byte(fmt.Sprintf("fill-del-%06d", i))
+		if err := d.Put(key, value); err != nil {
+			t.Fatalf("fill-del Put(%q) error: %v", key, err)
+		}
+		d.mu.Lock()
+		sstCount := len(d.ssts)
+		d.mu.Unlock()
+		if sstCount >= 2 {
+			break
+		}
+	}
+	waitForFlushState(t, d, 2)
+
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+
+	if _, err := d2.Get([]byte("a")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(a) after reopen err=%v, want ErrNotFound", err)
+	}
+
+	got := collectPairs(d2.NewIterator(nil))
+	for _, pair := range got {
+		if pair[0] == "a" {
+			t.Fatalf("iterator should not resurrect deleted key a, got=%v", got)
+		}
+	}
+
+	d2.mu.Lock()
+	defer d2.mu.Unlock()
+	if len(d2.ssts) < 2 {
+		t.Fatalf("reopen sst count = %d, want >= 2", len(d2.ssts))
+	}
+	if len(d2.immutables) != 0 {
+		t.Fatalf("reopen immutables = %d, want 0 when replay skips flushed segments", len(d2.immutables))
 	}
 }

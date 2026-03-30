@@ -1,0 +1,28 @@
+{
+  "next_sst_id": 3,
+  "flushed_wal_segment": 2,
+  "tables": [
+    {
+      "id": 2,
+      "level": 0,
+      "path": "sst/000002.sst",
+      "file_size": 67123040,
+      "record_count": 257,
+      "data_length": 67115014,
+      "block_index_length": 7926,
+      "min_key": "YQ==",
+      "max_key": "ZmlsbC1vbGQtMDAwMzQ0"
+    },
+    {
+      "id": 1,
+      "level": 0,
+      "path": "sst/000001.sst",
+      "file_size": 67123047,
+      "record_count": 257,
+      "data_length": 67115021,
+      "block_index_length": 7926,
+      "min_key": "YQ==",
+      "max_key": "ZmlsbC1vbGQtMDAwMjU1"
+    }
+  ]
+}

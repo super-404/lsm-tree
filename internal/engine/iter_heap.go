@@ -2,13 +2,13 @@ package engine
 
 import (
 	"bytes"
-	"lsm-tree/internal/db"
+	lsmiter "lsm-tree/internal/iter"
 )
 
 // iteratorItem 堆中一项：来源编号 + 子迭代器。
 type iteratorItem struct {
 	source int
-	it     db.Iterator
+	it     lsmiter.ValueIterator
 }
 
 // iteratorMinHeap 按 key 升序；同 key 下 source 升序（source 小表示更新：active/newer immutable）。
@@ -18,8 +18,8 @@ type iteratorMinHeap []iteratorItem
 func (h iteratorMinHeap) Len() int { return len(h) }
 
 func (h iteratorMinHeap) Less(i, j int) bool {
-	ki := h[i].it.Key()
-	kj := h[j].it.Key()
+	ki := h[i].it.Item().Key
+	kj := h[j].it.Item().Key
 	if c := bytes.Compare(ki, kj); c != 0 {
 		return c < 0
 	}

@@ -87,12 +87,6 @@ func TestSkiplistGenericString(t *testing.T) {
 	}
 }
 
-// TestSkiplistInterface 验证 NewSkiplist 返回值满足对外 SkiplistInterface 接口约束。
-func TestSkiplistInterface(t *testing.T) {
-	var _ SkiplistInterface[int] = NewSkiplist[int]()
-	var _ SkiplistInterface[string] = NewSkiplist[string]()
-}
-
 // Item 复杂结构体：用于测试 SkiplistCmp 对自定义类型的支持
 type Item struct {
 	ID    int64

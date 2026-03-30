@@ -1,0 +1,17 @@
+{
+  "next_sst_id": 2,
+  "flushed_wal_segment": 1,
+  "tables": [
+    {
+      "id": 1,
+      "level": 0,
+      "path": "sst/000001.sst",
+      "file_size": 67122548,
+      "record_count": 256,
+      "data_length": 67114752,
+      "block_index_length": 7684,
+      "min_key": "Zmx1c2gtay0wMDAwMDA=",
+      "max_key": "Zmx1c2gtay0wMDAyNTU="
+    }
+  ]
+}
