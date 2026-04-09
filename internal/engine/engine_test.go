@@ -5,6 +5,7 @@ import (
 	"fmt"
 	lsmiter "lsm-tree/internal/iter"
 	"lsm-tree/internal/memtable"
+	"lsm-tree/internal/sst"
 	"lsm-tree/internal/wal"
 	"math/rand"
 	"os"
@@ -14,7 +15,7 @@ import (
 	"time"
 )
 
-func fixedWALTestDir(t *testing.T, name string) string {
+func fixedWALTestDir(t testing.TB, name string) string {
 	t.Helper()
 	root, err := findRepoRoot()
 	if err != nil {
@@ -91,19 +92,68 @@ func waitForFlushState(t *testing.T, e *Engine, wantSSTs int) {
 		e.mu.Lock()
 		gotSSTs := len(e.ssts)
 		gotImmutables := len(e.immutables)
+		flushInFlight := e.flushInFlight
 		flushErr := e.flushErr
 		e.mu.Unlock()
 		if flushErr != nil {
 			t.Fatalf("flush failed: %v", flushErr)
 		}
-		if gotSSTs >= wantSSTs && gotImmutables == 0 {
+		// 测试里的“flush 完成”定义要和引擎里的发布时序保持一致：
+		//   - SST 已发布
+		//   - immutable 已摘掉
+		//   - flush worker 已经走到本轮结束（包含最佳努力的 WAL 回收）
+		// 否则这里会把“中间发布态”误判成最终完成态。
+		if gotSSTs >= wantSSTs && gotImmutables == 0 && !flushInFlight {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	t.Fatalf("waitForFlushState timeout: ssts=%d immutables=%d flushErr=%v", len(e.ssts), len(e.immutables), e.flushErr)
+	t.Fatalf("waitForFlushState timeout: ssts=%d immutables=%d flushInFlight=%v flushErr=%v", len(e.ssts), len(e.immutables), e.flushInFlight, e.flushErr)
+}
+
+func waitForCompactionState(t *testing.T, e *Engine, wantLevel0, wantAtLeastLevel1 int) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		e.mu.Lock()
+		level0 := 0
+		level1 := 0
+		for _, table := range e.ssts {
+			switch table.Meta().Level {
+			case 0:
+				level0++
+			case 1:
+				level1++
+			}
+		}
+		flushInFlight := e.flushInFlight
+		compactionInFlight := e.compactionInFlight
+		flushErr := e.flushErr
+		e.mu.Unlock()
+		if flushErr != nil {
+			t.Fatalf("background task failed: %v", flushErr)
+		}
+		if level0 == wantLevel0 && level1 >= wantAtLeastLevel1 && !flushInFlight && !compactionInFlight {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	level0 := 0
+	level1 := 0
+	for _, table := range e.ssts {
+		switch table.Meta().Level {
+		case 0:
+			level0++
+		case 1:
+			level1++
+		}
+	}
+	t.Fatalf("waitForCompactionState timeout: level0=%d level1=%d flushInFlight=%v compactionInFlight=%v flushErr=%v", level0, level1, e.flushInFlight, e.compactionInFlight, e.flushErr)
 }
 
 // TestLSMEngine_PutGetDelete 验证基础读写删语义：Put 后可读、Delete 后返回 ErrNotFound。
@@ -897,7 +947,7 @@ func TestLSMEngine_WALRecoveryDropsIncompleteBatch(t *testing.T) {
 
 // TestLSMEngine_WALSegmentRotateWithMemtableRotate 验证 memtable 轮转时 WAL 也会切换到下一个 segment。
 func TestLSMEngine_WALSegmentRotateWithMemtableRotate(t *testing.T) {
-	dir := fixedWALTestDir(t, "wal_segment_rotate")
+	dir := fixedWALTestDir(t, "engine_wal_segment_rotate")
 	seg1 := filepath.Join(dir, "wal", "000001.wal")
 	seg2 := filepath.Join(dir, "wal", "000002.wal")
 
@@ -976,6 +1026,14 @@ func TestLSMEngine_FlushPublishesSST(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, manifestFilename)); err != nil {
 		t.Fatalf("manifest not found: %v", err)
+	}
+	// flush 发布成功后，对应的 sealed WAL segment 应该被最佳努力清理掉；
+	// 与此同时，新 active 对应的活跃 segment 仍必须保留，供后续写入和崩溃恢复使用。
+	if _, err := os.Stat(filepath.Join(dir, "wal", "000001.wal")); !os.IsNotExist(err) {
+		t.Fatalf("sealed wal segment 000001.wal should be deleted after flush, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "wal", "000002.wal")); err != nil {
+		t.Fatalf("active wal segment 000002.wal should remain after flush: %v", err)
 	}
 
 	v, err := d.Get([]byte("flush-k-000000"))
@@ -1060,5 +1118,173 @@ func TestLSMEngine_FlushRecoveryWithDeleteAcrossSSTs(t *testing.T) {
 	}
 	if len(d2.immutables) != 0 {
 		t.Fatalf("reopen immutables = %d, want 0 when replay skips flushed segments", len(d2.immutables))
+	}
+}
+
+// TestLSMEngine_CompactionL0ToL1MergesVersions 验证最小可用 compaction 会把多个 L0 整理成 L1，
+// 并在归并时正确保留“最新逻辑记录”，不会让被 tombstone 覆盖的旧值复活。
+func TestLSMEngine_CompactionL0ToL1MergesVersions(t *testing.T) {
+	dir := fixedWALTestDir(t, "compaction_l0_to_l1_merges_versions")
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value := largeValue()
+	rounds := []func() error{
+		func() error { return d.Put([]byte("victim"), []byte("v1")) },
+		func() error { return d.Put([]byte("victim"), []byte("v2")) },
+		func() error { return d.Delete([]byte("victim")) },
+		func() error { return d.Put([]byte("keeper"), []byte("keep")) },
+	}
+
+	for roundIdx, prime := range rounds {
+		if err := prime(); err != nil {
+			t.Fatalf("prime round %d error: %v", roundIdx, err)
+		}
+		for i := 0; i < 4000; i++ {
+			key := []byte(fmt.Sprintf("compact-fill-%d-%06d", roundIdx, i))
+			if err := d.Put(key, value); err != nil {
+				t.Fatalf("fill Put(%q) error: %v", key, err)
+			}
+			d.mu.Lock()
+			sstCount := len(d.ssts)
+			d.mu.Unlock()
+			if sstCount >= roundIdx+1 {
+				break
+			}
+		}
+		waitForFlushState(t, d, roundIdx+1)
+	}
+
+	waitForCompactionState(t, d, 0, 1)
+
+	if _, err := d.Get([]byte("victim")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(victim) after compaction err=%v, want ErrNotFound", err)
+	}
+	if got, err := d.Get([]byte("keeper")); err != nil {
+		t.Fatalf("Get(keeper) error: %v", err)
+	} else if string(got) != "keep" {
+		t.Fatalf("Get(keeper) = %q, want %q", got, "keep")
+	}
+
+	d.mu.Lock()
+	level0 := 0
+	level1 := 0
+	victimPresent := false
+	for _, table := range d.ssts {
+		switch table.Meta().Level {
+		case 0:
+			level0++
+		case 1:
+			level1++
+		}
+		it := table.Entries()
+		for it.Valid() {
+			if string(it.Item().Key) == "victim" {
+				victimPresent = true
+				break
+			}
+			it.Next()
+		}
+		it.Close()
+	}
+	d.mu.Unlock()
+	if level0 != 0 {
+		t.Fatalf("level0 table count = %d, want 0 after compaction", level0)
+	}
+	if level1 < 1 {
+		t.Fatalf("level1 table count = %d, want >= 1 after compaction", level1)
+	}
+	if victimPresent {
+		t.Fatal("bottommost compaction should drop victim tombstone entirely, but victim key still exists in output entries")
+	}
+
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+
+	if _, err := d2.Get([]byte("victim")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(victim) after reopen err=%v, want ErrNotFound", err)
+	}
+	if got, err := d2.Get([]byte("keeper")); err != nil {
+		t.Fatalf("Get(keeper) after reopen error: %v", err)
+	} else if string(got) != "keep" {
+		t.Fatalf("Get(keeper) after reopen = %q, want %q", got, "keep")
+	}
+}
+
+// TestLSMEngine_RecoveryIgnoresOrphanSSTBeforeManifest 模拟“sst 已生成，但 MANIFEST 尚未发布就崩溃”。
+//
+// 这个场景的稳健性要求是：
+//   - 重启时只能信任 MANIFEST 中正式登记过的 SST
+//   - 任何未登记的孤儿 SST 都必须被忽略
+//   - 对应数据仍然要从 WAL 完整回放回来，不能丢失
+//
+// 为了让测试更有辨识度，这里故意让“孤儿 SST”里的值和 WAL 里的值不同。
+// 如果恢复后拿到的是 WAL 里的值，就说明重启确实没有错误地采用那份未发布 SST。
+func TestLSMEngine_RecoveryIgnoresOrphanSSTBeforeManifest(t *testing.T) {
+	dir := fixedWALTestDir(t, "recovery_ignores_orphan_sst")
+
+	d, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put([]byte("a"), []byte("wal-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put([]byte("b"), []byte("wal-b")); err != nil {
+		t.Fatal(err)
+	}
+	// 关闭只是在测试里释放句柄，方便手工构造“崩溃时遗留”的孤儿 SST。
+	// 这里没有发生 flush，因此 MANIFEST 不会发布任何 SST，恢复仍应完全依赖 WAL。
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 人工构造一份“已经落到磁盘，但还没写入 MANIFEST”的孤儿 SST。
+	// 其中 a 的值故意写成与 WAL 不同，额外再放一个只存在于孤儿 SST 的 z。
+	// 若恢复后仍读取到 wal-a 且 z 不存在，就能证明这份孤儿文件被正确忽略。
+	mt := memtable.NewMemtable()
+	mt.Put([]byte("a"), []byte("orphan-a"))
+	mt.Put([]byte("z"), []byte("orphan-z"))
+	orphanPath := filepath.Join(dir, "sst", "000001.sst")
+	if _, err := sst.WriteFile(orphanPath, 1, 0, mt.Entries()); err != nil {
+		t.Fatalf("WriteFile(orphan sst) error: %v", err)
+	}
+
+	d2, err := Open(dir, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+
+	if got, err := d2.Get([]byte("a")); err != nil {
+		t.Fatalf("Get(a) after reopen error: %v", err)
+	} else if string(got) != "wal-a" {
+		t.Fatalf("Get(a) after reopen = %q, want %q from WAL replay (orphan SST must be ignored)", got, "wal-a")
+	}
+	if got, err := d2.Get([]byte("b")); err != nil {
+		t.Fatalf("Get(b) after reopen error: %v", err)
+	} else if string(got) != "wal-b" {
+		t.Fatalf("Get(b) after reopen = %q, want %q", got, "wal-b")
+	}
+	if _, err := d2.Get([]byte("z")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(z) after reopen err=%v, want ErrNotFound because orphan SST must not be loaded", err)
+	}
+
+	d2.mu.Lock()
+	defer d2.mu.Unlock()
+	if len(d2.ssts) != 0 {
+		t.Fatalf("reopen sst count = %d, want 0 because orphan SST is not referenced by manifest", len(d2.ssts))
+	}
+	if len(d2.immutables) != 0 {
+		t.Fatalf("reopen immutables = %d, want 0 after WAL replay finishes", len(d2.immutables))
 	}
 }

@@ -209,6 +209,34 @@ func (l *WAL) CurrentSegmentID() int {
 	return l.segID
 }
 
+// DeleteSegmentsUpTo 最佳努力删除所有 id <= maxID 的 sealed WAL segment。
+//
+// 这里刻意不删除当前活跃 segment，即使调用方把 maxID 传得过大也会自动截断。
+// 这样 flush 成功后的 WAL 回收只会影响“已经被 SST + MANIFEST 覆盖”的旧段，
+// 不会误伤当前仍在接收写入的日志文件。
+func (l *WAL) DeleteSegmentsUpTo(maxID int) error {
+	if l == nil || maxID <= 0 {
+		return nil
+	}
+	segments, err := listSegments(l.dir)
+	if err != nil {
+		return err
+	}
+	activeID := l.segID
+	for _, seg := range segments {
+		if seg.id > maxID {
+			continue
+		}
+		if seg.id >= activeID {
+			continue
+		}
+		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (l *WAL) Close() error {
 	if l == nil || l.f == nil {
 		return nil

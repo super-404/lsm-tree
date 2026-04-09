@@ -7,26 +7,6 @@ import (
 	"testing"
 )
 
-func findRepoRoot(t *testing.T) string {
-	t.Helper()
-
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd() error: %v", err)
-	}
-	cur := wd
-	for {
-		if _, err := os.Stat(filepath.Join(cur, "go.mod")); err == nil {
-			return cur
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			t.Fatalf("go.mod not found from %s upward", wd)
-		}
-		cur = parent
-	}
-}
-
 func countDecodedRecordsInSegment(t *testing.T, path string) int {
 	t.Helper()
 
@@ -51,10 +31,25 @@ func countDecodedRecordsInSegment(t *testing.T, path string) int {
 }
 
 func TestWALReplayReadsBothRotatedSegments(t *testing.T) {
-	root := findRepoRoot(t)
-	dir := filepath.Join(root, "test", "wal", "wal_segment_rotate", "wal")
+	dir := t.TempDir()
 	seg1 := filepath.Join(dir, "000001.wal")
 	seg2 := filepath.Join(dir, "000002.wal")
+
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open(%s) error: %v", dir, err)
+	}
+	defer l.Close()
+
+	if err := l.Append(Record{Type: RecordPut, Key: []byte("k1"), Value: []byte("v1")}); err != nil {
+		t.Fatalf("Append(seg1) error: %v", err)
+	}
+	if err := l.Rotate(); err != nil {
+		t.Fatalf("Rotate(seg1->seg2) error: %v", err)
+	}
+	if err := l.Append(Record{Type: RecordPut, Key: []byte("k2"), Value: []byte("v2")}); err != nil {
+		t.Fatalf("Append(seg2) error: %v", err)
+	}
 
 	if _, err := os.Stat(seg1); err != nil {
 		t.Fatalf("segment1 missing: %v", err)
@@ -69,14 +64,14 @@ func TestWALReplayReadsBothRotatedSegments(t *testing.T) {
 		t.Fatalf("expected both segments to contain records, got seg1=%d seg2=%d", seg1Count, seg2Count)
 	}
 
-	l, err := Open(dir)
+	replayWAL, err := Open(dir)
 	if err != nil {
 		t.Fatalf("Open(%s) error: %v", dir, err)
 	}
-	defer l.Close()
+	defer replayWAL.Close()
 
 	replayed := 0
-	if err := l.Replay(func(rec DecodedRecord) error {
+	if err := replayWAL.Replay(func(rec DecodedRecord) error {
 		replayed++
 		return nil
 	}); err != nil {
@@ -90,4 +85,62 @@ func TestWALReplayReadsBothRotatedSegments(t *testing.T) {
 
 	t.Logf("decoded %d records from %s and %d records from %s", seg1Count, filepath.Base(seg1), seg2Count, filepath.Base(seg2))
 	t.Logf("Replay() successfully consumed both segments from %s", fmt.Sprintf("%s, %s", seg1, seg2))
+}
+
+func TestWALDeleteSegmentsUpToKeepsActiveSegment(t *testing.T) {
+	dir := t.TempDir()
+
+	l, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open(%s) error: %v", dir, err)
+	}
+	defer l.Close()
+
+	// 依次写出 3 个 segment，其中 000003.wal 保持为当前活跃 segment。
+	if err := l.Append(Record{Type: RecordPut, Key: []byte("k1"), Value: []byte("v1")}); err != nil {
+		t.Fatalf("Append(seg1) error: %v", err)
+	}
+	if err := l.Rotate(); err != nil {
+		t.Fatalf("Rotate(seg1->seg2) error: %v", err)
+	}
+	if err := l.Append(Record{Type: RecordPut, Key: []byte("k2"), Value: []byte("v2")}); err != nil {
+		t.Fatalf("Append(seg2) error: %v", err)
+	}
+	if err := l.Rotate(); err != nil {
+		t.Fatalf("Rotate(seg2->seg3) error: %v", err)
+	}
+	if err := l.Append(Record{Type: RecordPut, Key: []byte("k3"), Value: []byte("v3")}); err != nil {
+		t.Fatalf("Append(seg3) error: %v", err)
+	}
+
+	seg1 := filepath.Join(dir, "000001.wal")
+	seg2 := filepath.Join(dir, "000002.wal")
+	seg3 := filepath.Join(dir, "000003.wal")
+	for _, seg := range []string{seg1, seg2, seg3} {
+		if _, err := os.Stat(seg); err != nil {
+			t.Fatalf("expected segment %s to exist before cleanup: %v", seg, err)
+		}
+	}
+
+	if err := l.DeleteSegmentsUpTo(2); err != nil {
+		t.Fatalf("DeleteSegmentsUpTo(2) error: %v", err)
+	}
+
+	if _, err := os.Stat(seg1); !os.IsNotExist(err) {
+		t.Fatalf("segment %s should be deleted, stat err=%v", seg1, err)
+	}
+	if _, err := os.Stat(seg2); !os.IsNotExist(err) {
+		t.Fatalf("segment %s should be deleted, stat err=%v", seg2, err)
+	}
+	if _, err := os.Stat(seg3); err != nil {
+		t.Fatalf("active segment %s should remain after cleanup: %v", seg3, err)
+	}
+
+	// 即使上限传得比当前活跃段更大，也不能把活跃文件删掉。
+	if err := l.DeleteSegmentsUpTo(99); err != nil {
+		t.Fatalf("DeleteSegmentsUpTo(99) error: %v", err)
+	}
+	if _, err := os.Stat(seg3); err != nil {
+		t.Fatalf("active segment %s should still remain after oversized cleanup: %v", seg3, err)
+	}
 }

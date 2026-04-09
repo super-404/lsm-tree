@@ -249,10 +249,10 @@ func TestTrailerLocatesMetaFooterByBytes(t *testing.T) {
 		t.Fatalf("metaOffset = %d, want >= %d", metaOffset, fileHeaderSize)
 	}
 
-	// 加入 Block Index 后，Meta Footer 应该位于 Data Section 和 Block Index 之后。
-	wantMetaOffset := fileHeaderSize + int(writtenMeta.DataLength) + int(writtenMeta.BlockIndexLength)
+	// 加入 Block Index 和 Bloom Filter 后，Meta Footer 应该位于两者之后。
+	wantMetaOffset := fileHeaderSize + int(writtenMeta.DataLength) + int(writtenMeta.BlockIndexLength) + int(writtenMeta.BloomFilterLength)
 	if metaOffset != wantMetaOffset {
-		t.Fatalf("metaOffset = %d, want %d (header + dataLength + blockIndexLength)", metaOffset, wantMetaOffset)
+		t.Fatalf("metaOffset = %d, want %d (header + dataLength + blockIndexLength + bloomFilterLength)", metaOffset, wantMetaOffset)
 	}
 
 	metaBytes := raw[metaOffset : len(raw)-trailerSize]
@@ -278,6 +278,9 @@ func TestTrailerLocatesMetaFooterByBytes(t *testing.T) {
 	}
 	if parsedMeta.dataLength != writtenMeta.DataLength {
 		t.Fatalf("parsed dataLength = %d, want %d", parsedMeta.dataLength, writtenMeta.DataLength)
+	}
+	if parsedMeta.bloomFilterLength != writtenMeta.BloomFilterLength {
+		t.Fatalf("parsed bloomFilterLength = %d, want %d", parsedMeta.bloomFilterLength, writtenMeta.BloomFilterLength)
 	}
 	if parsedMeta.recordCount != writtenMeta.RecordCount {
 		t.Fatalf("parsed recordCount = %d, want %d", parsedMeta.recordCount, writtenMeta.RecordCount)
@@ -425,10 +428,32 @@ func TestOpenLoadsBlockIndexAndSupportsCrossBlockQueries(t *testing.T) {
 	if len(table.blocks) < 2 {
 		t.Fatalf("len(blocks) = %d, want >= 2", len(table.blocks))
 	}
+	if len(table.bloom.bits) == 0 {
+		t.Fatal("bloom filter should be loaded")
+	}
+	if !table.bloom.mayContain([]byte("k079")) {
+		t.Fatal("bloom filter reported false for an existing key")
+	}
 
 	value, op, found := table.GetLatest([]byte("k079"))
 	if !found || op != lsmiter.OpPut || len(value) != 2048 {
 		t.Fatalf("GetLatest(k079) = (len=%d,%v,%v), want (2048,OpPut,true)", len(value), op, found)
+	}
+
+	// 对一批不存在 key 做探测，至少应能找到一个被 Bloom Filter 明确排除的 miss。
+	foundBloomMiss := false
+	for i := 0; i < 1024; i++ {
+		key := []byte(fmt.Sprintf("missing-%03d", i))
+		if !table.bloom.mayContain(key) {
+			if v, op, ok := table.GetLatest(key); ok || op != 0 || v != nil {
+				t.Fatalf("GetLatest(%q) = (%q,%v,%v), want (nil,0,false)", key, v, op, ok)
+			}
+			foundBloomMiss = true
+			break
+		}
+	}
+	if !foundBloomMiss {
+		t.Fatal("expected bloom filter to reject at least one missing key")
 	}
 
 	got := collectValuePairs(table.ValuesRange([]byte("k055"), []byte("k060")))
@@ -461,6 +486,9 @@ func TestOpenRejectsMalformedFiles(t *testing.T) {
 		metaDataCRC32FieldOffset   = metaDataLengthFieldOffset + 8
 		metaBlockIndexOffsetField  = metaDataCRC32FieldOffset + 4
 		metaBlockIndexLengthField  = metaBlockIndexOffsetField + 8
+		metaBlockIndexCRC32Field   = metaBlockIndexLengthField + 8
+		metaBloomFilterOffsetField = metaBlockIndexCRC32Field + 4
+		metaBloomFilterCRC32Field  = metaBloomFilterOffsetField + 8 + 8
 	)
 
 	makeValidFile := func(t *testing.T, dir, name string) string {
@@ -616,6 +644,31 @@ func TestOpenRejectsMalformedFiles(t *testing.T) {
 				return path
 			},
 			wantErr: "invalid block index offset",
+		},
+		{
+			name: "invalid bloom filter offset",
+			build: func(t *testing.T) string {
+				path := makeValidFile(t, dir, "bad-bloom-filter-offset.sst")
+				raw, metaOffset := readRawAndMetaOffset(t, path)
+				blockIndexOffset := binary.LittleEndian.Uint64(raw[metaOffset+metaBlockIndexOffsetField : metaOffset+metaBlockIndexOffsetField+8])
+				blockIndexLength := binary.LittleEndian.Uint64(raw[metaOffset+metaBlockIndexLengthField : metaOffset+metaBlockIndexLengthField+8])
+				binary.LittleEndian.PutUint64(raw[metaOffset+metaBloomFilterOffsetField:metaOffset+metaBloomFilterOffsetField+8], blockIndexOffset+blockIndexLength+1)
+				writeBytes(t, path, raw)
+				return path
+			},
+			wantErr: "invalid bloom filter offset",
+		},
+		{
+			name: "invalid bloom filter crc",
+			build: func(t *testing.T) string {
+				path := makeValidFile(t, dir, "bad-bloom-filter-crc.sst")
+				raw, metaOffset := readRawAndMetaOffset(t, path)
+				storedCRC := binary.LittleEndian.Uint32(raw[metaOffset+metaBloomFilterCRC32Field : metaOffset+metaBloomFilterCRC32Field+4])
+				binary.LittleEndian.PutUint32(raw[metaOffset+metaBloomFilterCRC32Field:metaOffset+metaBloomFilterCRC32Field+4], storedCRC^0xFFFFFFFF)
+				writeBytes(t, path, raw)
+				return path
+			},
+			wantErr: "invalid bloom filter crc",
 		},
 	}
 

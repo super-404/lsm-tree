@@ -13,7 +13,10 @@ import (
 	"sync"
 )
 
-const maxMemtableSizeBytes = 64 << 20 // 64MB，超过则转为不可变并新建 active；后续可由 Options 配置
+const (
+	maxMemtableSizeBytes    = 64 << 20 // 64MB，超过则转为不可变并新建 active；后续可由 Options 配置
+	level0CompactionTrigger = 4        // 第一版 compaction 触发阈值：L0 文件数达到 4 开始整理到 L1
+)
 
 var (
 	ErrNotFound     = errors.New("engine: key not found")
@@ -45,19 +48,20 @@ type mutableTable interface {
 
 // Engine 基于 Memtable 实现：仅有一个 active Memtable，超过 64MB 时转入不可变列表并新建 active。
 type Engine struct {
-	mu            sync.Mutex
-	flushCond     *sync.Cond
-	active        mutableTable   // 当前可写
-	immutables    []mutableTable // 不可变列表，immutables[0] 为最新冻结的
-	ssts          []*sst.Table   // 已发布 SST，按新 -> 旧排列
-	dir           string
-	wal           *wal.WAL
-	manifest      *manifestState
-	flushCh       chan flushTask
-	flushInFlight bool
-	flushErr      error
-	closing       bool
-	closed        bool
+	mu                 sync.Mutex
+	flushCond          *sync.Cond
+	active             mutableTable   // 当前可写
+	immutables         []mutableTable // 不可变列表，immutables[0] 为最新冻结的
+	ssts               []*sst.Table   // 已发布 SST，按新 -> 旧排列
+	dir                string
+	wal                *wal.WAL
+	manifest           *manifestState
+	flushCh            chan flushTask
+	flushInFlight      bool
+	compactionInFlight bool
+	flushErr           error
+	closing            bool
+	closed             bool
 }
 
 // flushTask 描述一次待执行的 immutable -> SST 发布任务。
@@ -100,6 +104,7 @@ func Open(dir string, opts *Options) (*Engine, error) {
 		if fileMeta.FileSize != meta.FileSize ||
 			fileMeta.DataLength != meta.DataLength ||
 			fileMeta.BlockIndexLength != meta.BlockIndexLength ||
+			fileMeta.BloomFilterLength != meta.BloomFilterLength ||
 			!bytes.Equal(fileMeta.MinKey, meta.MinKey) ||
 			!bytes.Equal(fileMeta.MaxKey, meta.MaxKey) {
 			return nil, errors.New("engine: manifest and sst meta mismatch")
@@ -347,7 +352,7 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	e.closing = true
-	for e.flushInFlight {
+	for e.flushInFlight || e.compactionInFlight {
 		e.flushCond.Wait()
 	}
 	flushCh := e.flushCh
@@ -418,6 +423,14 @@ func (e *Engine) enqueueFlush(mt mutableTable, walSegment int) error {
 func (e *Engine) runFlushWorker() {
 	for task := range e.flushCh {
 		e.processFlushTask(task)
+		// flush 优先级高于 compaction：如果队列中已经有新的 flush task，
+		// 先继续处理 flush，避免 active 因为后台在整理旧 SST 而更快触发背压。
+		if len(e.flushCh) > 0 {
+			continue
+		}
+		if err := e.maybeCompactL0ToL1(); err != nil {
+			e.finishBackgroundError(err)
+		}
 	}
 }
 
@@ -431,14 +444,14 @@ func (e *Engine) processFlushTask(task flushTask) {
 	fullPath := filepath.Join(e.dir, filepath.FromSlash(relPath))
 	meta, err := sst.WriteFile(fullPath, task.sstID, 0, mtEntryIter)
 	if err != nil {
-		e.finishFlushWithError(err)
+		e.finishBackgroundError(err)
 		return
 	}
 	meta.Path = relPath
 
 	table, err := sst.Open(fullPath)
 	if err != nil {
-		e.finishFlushWithError(err)
+		e.finishBackgroundError(err)
 		return
 	}
 	table.SetPublishedMeta(meta)
@@ -459,7 +472,7 @@ func (e *Engine) processFlushTask(task flushTask) {
 	e.mu.Unlock()
 
 	if err := saveManifest(e.dir, nextManifest); err != nil {
-		e.finishFlushWithError(err)
+		e.finishBackgroundError(err)
 		return
 	}
 
@@ -467,15 +480,34 @@ func (e *Engine) processFlushTask(task flushTask) {
 	e.manifest = nextManifest
 	e.ssts = append([]*sst.Table{table}, e.ssts...)
 	e.removeImmutable(task.mt)
+	cleanupWAL := e.wal
+	cleanupSegment := nextManifest.FlushedWALSegment
+	e.mu.Unlock()
+
+	// 旧 WAL segment 的删除只是空间回收动作，不应影响 flush 的发布语义：
+	//   - 若在这里崩溃，恢复仍然会以 manifest 的 flushed 边界为准跳过旧段；
+	//   - 若删除失败，也只是多残留一些旧日志文件，不会让本次 SST 发布失效。
+	// 因此这里采用“先发布，再锁外最佳努力清理”的策略。
+	if cleanupWAL != nil && cleanupSegment > 0 {
+		_ = cleanupWAL.DeleteSegmentsUpTo(cleanupSegment)
+	}
+
+	// flush 对外“真正完成”的时点放在这里：
+	//   - SST 已发布
+	//   - immutable 已摘除
+	//   - 旧 WAL 的最佳努力清理也已执行过
+	// 这样等待 flush 完成的调用方看到的状态会更收敛，测试和恢复语义也更直观。
+	e.mu.Lock()
 	e.flushInFlight = false
 	e.flushCond.Broadcast()
 	e.mu.Unlock()
 }
 
-func (e *Engine) finishFlushWithError(err error) {
+func (e *Engine) finishBackgroundError(err error) {
 	e.mu.Lock()
 	e.flushErr = err
 	e.flushInFlight = false
+	e.compactionInFlight = false
 	e.flushCond.Broadcast()
 	e.mu.Unlock()
 }
